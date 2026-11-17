@@ -57,6 +57,62 @@ BATTERY  : percent
 ROLE_REQ : target        ROLE_ACK : role
 ```
 
+### TWS 排帧：定时器 → 开窗 → RX 中断 → 再定时
+
+TWS 的 MEDIA/KEY/SYNC 消息最终都承载在 L2CAP/ACL 上，所以排帧分两层：
+
+1. **基带排帧**（`bt/le/le_link.c`、`bt/edr/edr_link.c`、`le_timer.c`、`le_irq.c`）
+   - 每条 TWS 链路一个 anchor，时间单位 625µs
+   - 定时器在 `anchor - 2 slots` 提前醒来，到 anchor 打开 RX 窗口（winsize + widening）
+   - 收到包触发 `RX_DONE` 中断，ISR 只做：读 HW buffer → `rx_ring` → ACK
+   - 之后重新 `arm(next_anchor - 2)`，等下一个连接事件
+2. **TWS 应用排帧**（`bt/profiles/tws.c`）
+   - `tws_relay_media()` / `tws_send_key()` 等把消息写入 `tx_ring`
+   - 窗口到来时从 `tx_ring` 取帧发送；窗口内可连续发多帧（受 winsize/缓冲限制）
+   - 接收侧 `rx_ring` 由 `tws_rx()` 消费，按 `type/seq/len` 分发
+
+时序（slot = 625µs）：
+
+```
+slot        N-2              N-1            N(anchor)        N+1          N+2
+timer       |── arm(anchor-2) ────────────>| IRQ wake
+radio                                      [window open: winsize + widen]
+TX 主耳                                    [TWS MEDIA #k / KEY / SYNC]
+RX 副耳                                    [window]──RX_DONE IRQ──> rx_ring ─> tws_rx()
+re-arm      next_anchor = N + interval_slots；timer = next_anchor - 2
+```
+
+伪代码：
+
+```c
+/* 连接建立后 */
+anchor = now + interval_slots;
+le_timer_arm(anchor - 2);          /* 提前 2 slot 醒来 */
+
+/* 定时器到点 */
+window_open():
+    radio_tune(csa2(aa, event_counter, ch_map));
+    le_hw_set_window(winsize, widen);
+    le_hw_enable(true);            /* 开接收窗口 */
+
+/* RX 中断 */
+rx_done_irq():
+    pdu = le_hw_rx_read();
+    le_ring_push(&rx_ring, pdu);
+    tws_rx(tws, bt_buf);           /* 或 le_ll_rx() */
+    if (!le_ring_empty(&tx_ring))
+        send_next_from_tx_ring();
+    le_hw_enable(false);
+    anchor += interval_slots;
+    le_timer_arm(anchor - 2);      /* 收下一个包 */
+```
+
+要点：
+- **提前 2 slot 醒来**是为了给 RF 稳定、时钟漂移和窗口 widening 留余量
+- 窗口内没收到包则超时，直接 re-arm 下一个 anchor；不阻塞
+- TWS 的上下行（MEDIA / MEDIA_UP）共用同一个 anchor 调度，方向由发送侧决定
+- 当前 host 自测用 stub 替代了定时器/中断；目标端由 `le_link/edr_link` 的真实 tick + IRQ 驱动
+
 ### 时序 1：建链与 HELLO
 
 ```
