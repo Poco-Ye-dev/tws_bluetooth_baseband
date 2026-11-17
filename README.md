@@ -1,3 +1,5 @@
+我有很多公司的tws实际量产的基带代码，但是我不能公开，这个是我用ai重写的，而且像这种小单片机技术壁垒并不高，网上很多，仅供学习。
+
 # TWS Bluetooth Baseband (src_ai)
 
 面向学习用途的蓝牙/TWS 重写工程：从 HCI、L2CAP、经典 Profile，到 LE/EDR 基带骨架，以及 TWS v3 主副耳协议与双向音频同步仿真。
@@ -57,61 +59,109 @@ BATTERY  : percent
 ROLE_REQ : target        ROLE_ACK : role
 ```
 
-### TWS 排帧：定时器 → 开窗 → RX 中断 → 再定时
+### 经典蓝牙 TWS 排帧（BR/EDR）
 
-TWS 的 MEDIA/KEY/SYNC 消息最终都承载在 L2CAP/ACL 上，所以排帧分两层：
+TWS 不是 BLE 的连接事件模型。TWS 在经典蓝牙里是两条 BR/EDR 链路：
 
-1. **基带排帧**（`bt/le/le_link.c`、`bt/edr/edr_link.c`、`le_timer.c`、`le_irq.c`）
-   - 每条 TWS 链路一个 anchor，时间单位 625µs
-   - 定时器在 `anchor - 2 slots` 提前醒来，到 anchor 打开 RX 窗口（winsize + widening）
-   - 收到包触发 `RX_DONE` 中断，ISR 只做：读 HW buffer → `rx_ring` → ACK
-   - 之后重新 `arm(next_anchor - 2)`，等下一个连接事件
-2. **TWS 应用排帧**（`bt/profiles/tws.c`）
-   - `tws_relay_media()` / `tws_send_key()` 等把消息写入 `tx_ring`
-   - 窗口到来时从 `tx_ring` 取帧发送；窗口内可连续发多帧（受 winsize/缓冲限制）
-   - 接收侧 `rx_ring` 由 `tws_rx()` 消费，按 `type/seq/len` 分发
+- 手机 ↔ 主耳：一条 ACL（音频 A2DP、控制 AVRCP、通话 SCO/eSCO）
+- 主耳 ↔ 副耳：另一条 TWS ACL（TWS 私有协议 + 媒体/同步/控制）
 
-时序（slot = 625µs）：
+两条链路共享同一个 625µs slot 时钟，由控制器分时调度。
+
+#### 1. 时隙与主从
 
 ```
-slot        N-2              N-1            N(anchor)        N+1          N+2
-timer       |── arm(anchor-2) ────────────>| IRQ wake
-radio                                      [window open: winsize + widen]
-TX 主耳                                    [TWS MEDIA #k / KEY / SYNC]
-RX 副耳                                    [window]──RX_DONE IRQ──> rx_ring ─> tws_rx()
-re-arm      next_anchor = N + interval_slots；timer = next_anchor - 2
+slot:      2k            2k+1          2k+2          2k+3
+手机 piconet:  M(phone) TX   S(主耳) RX   M(phone) TX   S(主耳) RX
+TWS  piconet:                              M(主耳) TX    S(副耳) RX
 ```
 
-伪代码：
+- master 在偶数 slot 发，slave 在奇数 slot 回；包可占 1/3/5 个 slot（DM1/DH1 … 3-DH5）
+- 主耳对手机通常是 slave，对副耳是 master（或通过角色切换交换）
+- 没有 BLE 的 connection interval；靠 master 轮询 + slot 分配
+
+#### 2. 8 个硬件 frame 上下文
+
+`BREDR_FRAME_NUM = 8`（`classic_new/bredr_regs.h`），每个 frame 是一个 LT_ADDR/链路调度上下文：
+
+```
+bredr_bd_get_frame()
+    ├─ 分配空闲 frame，设置 frame->id
+    ├─ __write_reg_bdaddr()   对端地址
+    ├─ __write_reg_format()   包类型（DM/DH/2-DH/3-DH…）
+    ├─ __write_reg_clkoffset() 时钟偏移
+    ├─ windset(frame, winsize, wide, widen)  RX 窗口
+    ├─ bdhw_set_afh(frame, …)  AFH 频率表
+    └─ bd_set_prio(frame, prio)
+
+set_slot_triger()  → 硬件在指定 slot 发/收
+RX IRQ → bredr_rx_irq_handler() → 分发 TWS/L2CAP → bredr_bd_put_frame()
+```
+
+优先级（高到低）：**eSCO/SCO 语音 > TWS 控制/同步 > A2DP ACL > 空闲 POLL**。
+
+#### 3. 双链路 slot 调度
+
+主耳同时维护手机链路和 TWS 链路：
+
+- 手机 master 决定的 slot 用于收手机包/回 ACK
+- 剩余 slot 分配给 TWS 链路：TWS 媒体转发、tlcap 控制、AFH/同步
+- 多 slot 包（DH3/DH5）会占用连续 slot，调度时先预留
+- SCO/eSCO 先占时隙，TWS 与 A2DP 让路；Sniff 时合并窗口
+- 空闲发 POLL/NULL 维持链路，不做无意义重传
+
+#### 4. RX 中断与 frame 回收
+
+```
+TX: 填 TX buffer → set_slot_triger → 下一个 master slot 发出
+RX: windset 打开接收窗口 → 包到 → BREDR_INT0 中断
+    → bredr_rx_irq_handler()
+        ├─ 按 frame id / LT_ADDR 找 frame
+        ├─ 校验 CRC/HEC，处理 ARQ（SEQN/ARQN）
+        ├─ 分发：TWS 数据 → tws 协议；L2CAP → 上层
+        └─ bredr_bd_put_frame() 或复用到下一包
+```
+
+#### 5. TWS 同步：AFH 与 slot_end
+
+`tws_afh.c` 用 slot 时钟对齐两耳的 AFH 切换点：
 
 ```c
-/* 连接建立后 */
-anchor = now + interval_slots;
-le_timer_arm(anchor - 2);          /* 提前 2 slot 醒来 */
+u32 slot_end = bredr_get_master_slot_clk(tws_link);
+slot_end += 400;
+if (lmp_get_esco_conn_statu())      slot_end += 800;
+if (tws_link_get_sniff_status(tws_link)) slot_end += 6000;
 
-/* 定时器到点 */
-window_open():
-    radio_tune(csa2(aa, event_counter, ch_map));
-    le_hw_set_window(winsize, widen);
-    le_hw_enable(true);            /* 开接收窗口 */
-
-/* RX 中断 */
-rx_done_irq():
-    pdu = le_hw_rx_read();
-    le_ring_push(&rx_ring, pdu);
-    tws_rx(tws, bt_buf);           /* 或 le_ll_rx() */
-    if (!le_ring_empty(&tx_ring))
-        send_next_from_tx_ring();
-    le_hw_enable(false);
-    anchor += interval_slots;
-    le_timer_arm(anchor - 2);      /* 收下一个包 */
+memcpy(&tx_buf[10], &slot_end, 4);
+tlcap_send_cmd(TWS_AFH_CHANNEL, MASTER_CHANNEL_MAP, "c14", tx_buf);
+tws_link_set_tws_afh(tws_link, slot_end, tx_buf);
 ```
 
-要点：
-- **提前 2 slot 醒来**是为了给 RF 稳定、时钟漂移和窗口 widening 留余量
-- 窗口内没收到包则超时，直接 re-arm 下一个 anchor；不阻塞
-- TWS 的上下行（MEDIA / MEDIA_UP）共用同一个 anchor 调度，方向由发送侧决定
-- 当前 host 自测用 stub 替代了定时器/中断；目标端由 `le_link/edr_link` 的真实 tick + IRQ 驱动
+即：**在消息里带“生效 slot”，两耳在同一个 slot_end 切换信道图**；eSCO 和 Sniff 分别留更大余量。
+
+其他同步：
+- `tws_lmp_sync.c`：slot 时钟/偏移同步
+- `tws_media_sync.c` / `local_media_sync.c`：媒体时间戳/播放对齐
+- `tws_esco.c` / `tws_esco_role_sw.c`：语音时隙与角色切换
+
+#### 6. TWS 媒体转发（经典蓝牙）
+
+```
+手机 --A2DP(SBC/AAC)--> 主耳 sink --重打包--> TWS ACL --slot 调度--> 副耳
+                                                                      ↓
+                                             TWS 媒体同步(timestamp) → 解码 → 播放
+```
+
+主耳把 A2DP 媒体重新封成 TWS 媒体包，放入 TWS 链路的 ctrl_frame 队列；副耳收到后按 `tws_media_sync` 的时间戳对齐播放。语音走 eSCO 预留 slot，优先于媒体 ACL。
+
+#### 7. 与 src_ai 的对应/差距
+
+`src_ai` 的 EDR 侧是对上述流程的简化：
+
+- 有：`bt/edr/edr_frame.c`（优先级帧队列）、`edr_hw.c`（模拟寄存器：slot trigger/window/AFH/IRQ）、`edr_irq.c`（8 实例 RX/TX/SLOT 中断）、`edr_link.c`（8 frame + 定时器 + 双 ring）、`tws.c`（TWS 消息）
+- 缺：原厂的 `set_slot_triger` 精确时隙、`windset` 窗口 widening、`bd_set_prio` 全优先级、AFH 的 `slot_end` 同步、eSCO 重传窗口、Sniff 实际窗口
+
+所以文档里的“slot 级排帧”是经典蓝牙的正确原理；`src_ai` 目前用 `edr_link_tick()` 轮询 + 8 frame 队列近似，尚未做到逐 slot 的硬件级调度。
 
 ### 时序 1：建链与 HELLO
 
