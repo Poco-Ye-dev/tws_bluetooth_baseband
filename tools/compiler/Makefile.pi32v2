@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: MIT
+#
+# pi32v2 compiler description for the tools/ layout.  The build system uses
+# make/toolchain.mk; this file exists for external scripts that only look for
+# tools/compiler.
+
+TCL_TOOLS ?= /opt/pi32v2
+
+CC  ?= /opt/reltool/pi32v2/bin/clang
+LD  ?= $(TCL_TOOLS)/bin/lto-wrapper
+AR  ?= $(TCL_TOOLS)/bin/lto-ar
+VER ?= /opt/utils/replacetime
+
+CC_ARGS += \
+  -target pi32v2 -mcpu=r3 \
+  -mllvm -pi32v2-merge-max-offset=4096 \
+  -fno-common -integrated-as -Oz -c -g -flto \
+  -Wreturn-type -Werror
+
+AR_ARGS += -r -s

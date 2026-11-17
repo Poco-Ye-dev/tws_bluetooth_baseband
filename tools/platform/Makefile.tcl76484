@@ -1,0 +1,7 @@
+# SPDX-License-Identifier: MIT
+#
+# Compatibility shim: the canonical platform description lives in
+# make/platform/.  External tooling can include this file by the historical
+# path.
+
+include $(ROOT)/make/platform/tcl76484.mk

@@ -1,0 +1,6 @@
+tmp/
+*.o
+*.d
+*.a
+*.elf
+compile_commands.json
